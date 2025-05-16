@@ -1,4 +1,9 @@
 #include "systemcalls.h"
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <errno.h>
 
 /**
  * @param cmd the command to execute with system()
@@ -16,7 +21,9 @@ bool do_system(const char *cmd)
  *   and return a boolean true if the system() call completed with success
  *   or false() if it returned a failure
 */
-
+    int ret;
+    ret = system(cmd);
+    if (ret == -1) return false;
     return true;
 }
 
@@ -58,7 +65,30 @@ bool do_exec(int count, ...)
  *   as second argument to the execv() command.
  *
 */
+    int status;
+    pid_t pid;
+    int ret;
 
+    pid = fork();
+
+    if (pid == -1) {
+       return false;
+    } else if (pid == 0) {
+        ret = execv (command[0], command);
+        if (ret == -1) {
+            printf("DEBUG: Execute vector failed \n");
+            exit(errno);
+        }
+    }
+    wait(&status);
+
+    if(WIFEXITED(status) && (WEXITSTATUS(status) == 0)){
+        return true;
+    }
+    else
+    {
+        return false;
+    } 
     va_end(args);
 
     return true;
@@ -92,7 +122,33 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *   The rest of the behaviour is same as do_exec()
  *
 */
+    int status;
+    pid_t pid;
+    int ret;
 
+    int fd = open(outputfile, O_WRONLY|O_TRUNC|O_CREAT, 0644);
+
+    if (fd < 0) { 
+        perror("open"); 
+        return false; 
+    }
+    pid = fork ();
+    if (pid == -1)
+        return false;
+    else if (pid == 0) {
+        if (dup2(fd, 1) < 0) {
+            perror("dup2");
+                return false;
+        }
+        ret = execv (command[0], command);
+        if (ret == -1) return false;
+    }
+
+    if (waitpid (pid, &status, 0) == -1)
+        return false;
+    else if (WIFEXITED (status))
+        return WEXITSTATUS (status);
+    
     va_end(args);
 
     return true;
