@@ -77,7 +77,6 @@ else
     cd busybox
 fi
 
-
 # TODO: Make and install busybox
 make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE}
 make CONFIG_PREFIX="$OUTDIR/rootfs" ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} install
@@ -101,7 +100,8 @@ sudo mknod -m 600 ${OUTDIR}/rootfs/dev/console c 5 1
 
 # TODO: Clean and build the writer utility
 cd ${FINDER_APP_DIR}
-gcc -o writer writer.c
+make clean
+make COMPILER=${CROSS_COMPILE}
 cp writer ${OUTDIR}/rootfs/home
 
 if [ ! -d "${OUTDIR}/rootfs/home/conf" ]; then
