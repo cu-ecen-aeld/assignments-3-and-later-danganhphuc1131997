@@ -10,15 +10,27 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <signal.h>
+#include <pthread.h>
+#include <time.h>
 
 #define PORT 9000
 #define BACKLOG 5
 #define BUFFER_SIZE 1024
 #define FILE_PATH "/var/tmp/aesdsocketdata"
-#define INITIAL_PACKET_SIZE 4096 // Kích thước ban đầu của buffer động
+#define INITIAL_PACKET_SIZE 4096
+#define TIMESTAMP_INTERVAL 10 // 10 seconds
 
 static volatile int running = 1;
 static int server_fd = -1;
+static pthread_mutex_t mutex_file = PTHREAD_MUTEX_INITIALIZER;
+
+// Linked list node for thread management
+struct thread_node {
+    pthread_t thread;
+    struct thread_node *next;
+};
+
+static struct thread_node *thread_list = NULL;
 
 void signal_handler(int signo) {
     if (signo == SIGINT || signo == SIGTERM) {
@@ -58,12 +70,150 @@ int daemonize() {
     return 0;
 }
 
+void add_thread(pthread_t thread) {
+    struct thread_node *node = malloc(sizeof(struct thread_node));
+    if (node) {
+        node->thread = thread;
+        node->next = thread_list;
+        thread_list = node;
+    }
+}
+
+// Function to free the thread list
+void free_thread_list() {
+    struct thread_node *current = thread_list;
+    while (current) {
+        struct thread_node *temp = current;
+        current = current->next;
+        free(temp);
+    }
+    thread_list = NULL;
+}
+
+void append_timestamp() {
+    time_t now = time(NULL);
+    struct tm *tm_info = gmtime(&now);
+    char timestamp[64];
+    strftime(timestamp, sizeof(timestamp), "timestamp:%a, %d %b %Y %H:%M:%S %z", tm_info);
+
+    pthread_mutex_lock(&mutex_file);
+    FILE *fp = fopen(FILE_PATH, "a");
+    if (fp) {
+        fprintf(fp, "%s\n", timestamp);
+        fflush(fp);
+        fclose(fp);
+    } else {
+        syslog(LOG_ERR, "Failed to open file %s for timestamp: %s", FILE_PATH, strerror(errno));
+    }
+    pthread_mutex_unlock(&mutex_file);
+}
+
+void *handle_connection(void *arg) {
+    int client_fd = *(int *)arg;
+    free(arg);
+
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    char client_ip[INET_ADDRSTRLEN] = "unknown";
+    
+    if (getpeername(client_fd, (struct sockaddr*)&client_addr, &client_len) == 0) {
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+    } else {
+        syslog(LOG_ERR, "Failed to get peer name: %s", strerror(errno));
+    }
+    syslog(LOG_INFO, "Accepted connection from %s", client_ip);
+
+    FILE *fp = fopen(FILE_PATH, "a+");
+    if (!fp) {
+        syslog(LOG_ERR, "Failed to open file %s: %s", FILE_PATH, strerror(errno));
+        close(client_fd);
+        return NULL;
+    }
+
+    char buffer[BUFFER_SIZE];
+    size_t packet_capacity = INITIAL_PACKET_SIZE;
+    char *packet_buffer = (char *)malloc(packet_capacity);
+    if (!packet_buffer) {
+        syslog(LOG_ERR, "Failed to allocate memory for packet_buffer");
+        fclose(fp);
+        close(client_fd);
+        return NULL;
+    }
+    size_t packet_len = 0;
+
+    while (running) {
+        ssize_t bytes_read = read(client_fd, buffer, BUFFER_SIZE);
+        if (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            usleep(10000);
+            continue;
+        } else if (bytes_read <= 0) {
+            if (bytes_read == 0) {
+                syslog(LOG_INFO, "Closed connection from %s", client_ip);
+            } else {
+                syslog(LOG_ERR, "Read error from %s: %s", client_ip, strerror(errno));
+            }
+            break;
+        }
+
+        if (packet_len + bytes_read > packet_capacity) {
+            packet_capacity *= 2;
+            char *new_buffer = realloc(packet_buffer, packet_capacity);
+            if (!new_buffer) {
+                syslog(LOG_ERR, "Failed to reallocate memory for packet_buffer");
+                free(packet_buffer);
+                fclose(fp);
+                close(client_fd);
+                return NULL;
+            }
+            packet_buffer = new_buffer;
+        }
+
+        memcpy(packet_buffer + packet_len, buffer, bytes_read);
+        packet_len += bytes_read;
+
+        for (size_t i = packet_len - bytes_read; i < packet_len; i++) {
+            if (packet_buffer[i] == '\n') {
+                size_t chunk_len = i + 1;
+                pthread_mutex_lock(&mutex_file);
+                fwrite(packet_buffer, 1, chunk_len, fp);
+                fflush(fp);
+                pthread_mutex_unlock(&mutex_file);
+                memmove(packet_buffer, packet_buffer + chunk_len, packet_len - chunk_len);
+                packet_len -= chunk_len;
+
+                pthread_mutex_lock(&mutex_file);
+                fseek(fp, 0, SEEK_SET);
+                char file_buf[BUFFER_SIZE];
+                size_t read_bytes;
+                while ((read_bytes = fread(file_buf, 1, sizeof(file_buf), fp)) > 0) {
+                    ssize_t sent = 0;
+                    while (sent < read_bytes) {
+                        ssize_t s = write(client_fd, file_buf + sent, read_bytes - sent);
+                        if (s < 0) {
+                            syslog(LOG_ERR, "Failed to send data to client %s: %s", client_ip, strerror(errno));
+                            break;
+                        }
+                        sent += s;
+                    }
+                }
+                fseek(fp, 0, SEEK_END);
+                pthread_mutex_unlock(&mutex_file);
+                break;
+            }
+        }
+    }
+
+    free(packet_buffer);
+    fclose(fp);
+    close(client_fd);
+    return NULL;
+}
+
 int main(int argc, char *argv[]) {
     int daemon_mode = 0;
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_len;
-    char buffer[BUFFER_SIZE];
-    ssize_t bytes_read, bytes_written;
+    time_t last_timestamp = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0) {
@@ -111,9 +261,22 @@ int main(int argc, char *argv[]) {
     }
 
     while (running) {
+        // Check and append timestamp every 10 seconds
+        time_t now = time(NULL);
+        if (now - last_timestamp >= TIMESTAMP_INTERVAL) {
+            append_timestamp();
+            last_timestamp = now;
+        }
+
         client_len = sizeof(client_addr);
-        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
-        if (client_fd < 0) {
+        int *client_fd = malloc(sizeof(int));
+        if (!client_fd) {
+            syslog(LOG_ERR, "Failed to allocate memory for client_fd");
+            continue;
+        }
+        *client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
+        if (*client_fd < 0) {
+            free(client_fd);
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 usleep(10000);
                 continue;
@@ -122,119 +285,29 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        syslog(LOG_INFO, "Accepted connection from %s", inet_ntoa(client_addr.sin_addr));
-
-        FILE *fp = fopen(FILE_PATH, "a+");
-        if (!fp) {
-            syslog(LOG_ERR, "Failed to open file %s: %s", FILE_PATH, strerror(errno));
-            close(client_fd);
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, handle_connection, client_fd) != 0) {
+            syslog(LOG_ERR, "Failed to create thread: %s", strerror(errno));
+            free(client_fd);
+            close(*client_fd);
             continue;
         }
-
-        flags = fcntl(client_fd, F_GETFL, 0);
-        fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
-
-        // Cấp phát bộ nhớ động cho packet_buffer
-        size_t packet_capacity = INITIAL_PACKET_SIZE;
-        char *packet_buffer = (char *)malloc(packet_capacity);
-        if (!packet_buffer) {
-            syslog(LOG_ERR, "Failed to allocate memory for packet_buffer");
-            fclose(fp);
-            close(client_fd);
-            continue;
-        }
-        size_t packet_len = 0;
-
-        while (running) {
-            bytes_read = read(client_fd, buffer, BUFFER_SIZE);
-            if (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                usleep(10000);
-                continue;
-            } else if (bytes_read <= 0) {
-                // Client đóng kết nối hoặc lỗi, ghi dữ liệu còn lại nếu có
-                if (packet_len > 0) {
-                    bytes_written = fwrite(packet_buffer, 1, packet_len, fp);
-                    if (bytes_written != packet_len) {
-                        syslog(LOG_ERR, "Failed to write to file");
-                    }
-                    fflush(fp);
-                }
-                break;
-            }
-
-            // Nếu buffer không đủ, mở rộng bằng realloc
-            if (packet_len + bytes_read > packet_capacity) {
-                packet_capacity *= 2; // Tăng gấp đôi dung lượng
-                char *new_buffer = (char *)realloc(packet_buffer, packet_capacity);
-                if (!new_buffer) {
-                    syslog(LOG_ERR, "Failed to reallocate memory for packet_buffer");
-                    free(packet_buffer);
-                    fclose(fp);
-                    close(client_fd);
-                    continue;
-                }
-                packet_buffer = new_buffer;
-            }
-
-            // Copy dữ liệu vào packet_buffer
-            memcpy(packet_buffer + packet_len, buffer, bytes_read);
-            packet_len += bytes_read;
-
-            // Tìm ký tự xuống dòng
-            int found_newline = 0;
-            for (size_t i = packet_len - bytes_read; i < packet_len; i++) {
-                if (packet_buffer[i] == '\n') {
-                    found_newline = 1;
-                    size_t chunk_len = i + 1; // Bao gồm cả \n
-                    bytes_written = fwrite(packet_buffer, 1, chunk_len, fp);
-                    if (bytes_written != chunk_len) {
-                        syslog(LOG_ERR, "Failed to write to file");
-                    }
-                    fflush(fp);
-
-                    // Dịch dữ liệu còn lại (nếu có) về đầu buffer
-                    memmove(packet_buffer, packet_buffer + chunk_len, packet_len - chunk_len);
-                    packet_len -= chunk_len;
-
-                    // Gửi nội dung file về client
-                    fseek(fp, 0, SEEK_SET);
-                    char file_buf[BUFFER_SIZE];
-                    size_t read_bytes;
-                    while ((read_bytes = fread(file_buf, 1, sizeof(file_buf), fp)) > 0) {
-                        ssize_t sent = 0;
-                        while (sent < read_bytes) {
-                            ssize_t s = write(client_fd, file_buf + sent, read_bytes - sent);
-                            if (s < 0) {
-                                syslog(LOG_ERR, "Failed to send data to client: %s", strerror(errno));
-                                break;
-                            }
-                            sent += s;
-                        }
-                    }
-                    fseek(fp, 0, SEEK_END);
-                    break; // Thoát vòng lặp tìm \n để xử lý dữ liệu tiếp theo
-                }
-            }
-
-            // Nếu không tìm thấy \n, tiếp tục nhận dữ liệu
-            if (!found_newline) {
-                continue;
-            }
-        }
-
-        if (bytes_read == 0) {
-            syslog(LOG_INFO, "Closed connection from %s", inet_ntoa(client_addr.sin_addr));
-        } else if (bytes_read < 0) {
-            syslog(LOG_ERR, "Read error: %s", strerror(errno));
-        }
-
-        free(packet_buffer); // Giải phóng bộ nhớ
-        fclose(fp);
-        close(client_fd);
+        add_thread(thread);
     }
+
+    // Join all threads and free thread list
+    struct thread_node *current = thread_list;
+    while (current) {
+        pthread_join(current->thread, NULL);
+        struct thread_node *temp = current;
+        current = current->next;
+        free(temp);
+    }
+    thread_list = NULL; // Ensure list is cleared
 
     printf("Closing program ... \r\n");
 
+    pthread_mutex_destroy(&mutex_file);
     if (server_fd >= 0) {
         close(server_fd);
     }
