@@ -1,13 +1,28 @@
-CC = gcc
-TARGET = aesdsocket
-SRCS = $(wildcard *.c)
+# Compiler and flags
+CC ?= $(CROSS_COMPILE)gcc
+CFLAGS ?= -g -Wall -Wextra -O2
+LDFLAGS ?= -pthread
+INCLUDE = -I.
 
-ifdef CROSS_COMPILE
-	CC = $(CROSS_COMPILE)gcc
-endif
+# Target executable and source files
+TARGET := aesdsocket
+SRCS := $(TARGET).c
+OBJS := $(SRCS:.c=.o)
 
-all:
-	$(CC) $(SRCS) -o $(TARGET)
+# Phony targets
+.PHONY: all clean
 
+# Default target
+all: $(TARGET)
+
+# Link object files to create the executable
+$(TARGET): $(OBJS)
+	$(CC) $(CFLAGS) $(INCLUDE) $(LDFLAGS) -o $@ $^
+
+# Compile source files to object files
+%.o: %.c
+	$(CC) $(CFLAGS) $(INCLUDE) -c -o $@ $<
+
+# Clean build artifacts
 clean:
-	rm -f $(TARGET)
+	rm -f $(OBJS) $(TARGET)
