@@ -16,7 +16,12 @@
 #define PORT 9000
 #define BACKLOG 5
 #define BUFFER_SIZE 1024
+#define USE_AESD_CHAR_DEVICE 1
+#ifdef USE_AESD_CHAR_DEVICE 
+#define FILE_PATH "/dev/aesdchar"
+#else
 #define FILE_PATH "/var/tmp/aesdsocketdata"
+#endif
 #define INITIAL_PACKET_SIZE 4096
 #define TIMESTAMP_INTERVAL 10 // 10 seconds
 
@@ -90,6 +95,7 @@ void free_thread_list() {
     thread_list = NULL;
 }
 
+#ifndef USE_AESD_CHAR_DEVICE
 void append_timestamp() {
     time_t now = time(NULL);
     struct tm *tm_info = gmtime(&now);
@@ -107,6 +113,7 @@ void append_timestamp() {
     }
     pthread_mutex_unlock(&mutex_file);
 }
+#endif
 
 void *handle_connection(void *arg) {
     int client_fd = *(int *)arg;
@@ -261,13 +268,14 @@ int main(int argc, char *argv[]) {
     }
 
     while (running) {
+        #ifndef USE_AESD_CHAR_DEVICE
         // Check and append timestamp every 10 seconds
         time_t now = time(NULL);
         if (now - last_timestamp >= TIMESTAMP_INTERVAL) {
             append_timestamp();
             last_timestamp = now;
         }
-
+        #endif
         client_len = sizeof(client_addr);
         int *client_fd = malloc(sizeof(int));
         if (!client_fd) {
@@ -311,11 +319,11 @@ int main(int argc, char *argv[]) {
     if (server_fd >= 0) {
         close(server_fd);
     }
-
+#ifndef USE_AESD_CHAR_DEVICE
     if (remove(FILE_PATH) != 0) {
         syslog(LOG_ERR, "Failed to delete file %s: %s", FILE_PATH, strerror(errno));
     }
-
+#endif
     closelog();
     return 0;
 }
