@@ -13,6 +13,9 @@
 #include <pthread.h>
 #include <time.h>
 
+#include "../aesd-char-driver/aesd_ioctl.h"
+#include <sys/ioctl.h>
+
 #define PORT 9000
 #define BACKLOG 5
 #define BUFFER_SIZE 1024
@@ -181,15 +184,45 @@ void *handle_connection(void *arg) {
         for (size_t i = packet_len - bytes_read; i < packet_len; i++) {
             if (packet_buffer[i] == '\n') {
                 size_t chunk_len = i + 1;
-                pthread_mutex_lock(&mutex_file);
-                fwrite(packet_buffer, 1, chunk_len, fp);
+                packet_buffer[chunk_len] = '\0'; // Null terminate for safe parsing
+
+                int is_ioctl_cmd = 0;
+
+                #ifdef USE_AESD_CHAR_DEVICE
+                if (strncmp(packet_buffer, "AESDCHAR_IOCSEEKTO:", strlen("AESDCHAR_IOCSEEKTO:")) == 0) {
+                    unsigned int write_cmd = 0, write_cmd_offset = 0;
+                    if (sscanf(packet_buffer + strlen("AESDCHAR_IOCSEEKTO:"), "%u,%u", &write_cmd, &write_cmd_offset) == 2) {
+                        struct aesd_seekto seekto;
+                        seekto.write_cmd = write_cmd;
+                        seekto.write_cmd_offset = write_cmd_offset;
+                        pthread_mutex_lock(&mutex_file);
+                        if (ioctl(fileno(fp), AESDCHAR_IOCSEEKTO, &seekto) == -1) {
+                            syslog(LOG_ERR, "ioctl AESDCHAR_IOCSEEKTO failed: %s", strerror(errno));
+                        } else {
+                            syslog(LOG_INFO, "Performed ioctl AESDCHAR_IOCSEEKTO: %u, %u", write_cmd, write_cmd_offset);
+                        }
+                        pthread_mutex_unlock(&mutex_file);
+                        is_ioctl_cmd = 1;
+                    } else {
+                        syslog(LOG_ERR, "Malformed AESDCHAR_IOCSEEKTO command: %s", packet_buffer);
+                    }
+                }
+                #endif
+
+                if (!is_ioctl_cmd) {
+                    pthread_mutex_lock(&mutex_file);
+                    fwrite(packet_buffer, 1, chunk_len, fp);
+                    fflush(fp);
+                    pthread_mutex_unlock(&mutex_file);
+                }
                 fflush(fp);
-                pthread_mutex_unlock(&mutex_file);
                 memmove(packet_buffer, packet_buffer + chunk_len, packet_len - chunk_len);
                 packet_len -= chunk_len;
 
                 pthread_mutex_lock(&mutex_file);
-                fseek(fp, 0, SEEK_SET);
+                if (!is_ioctl_cmd) {
+                    fseek(fp, 0, SEEK_SET);  // Chỉ fseek nếu không phải ioctl
+                }
                 char file_buf[BUFFER_SIZE];
                 size_t read_bytes;
                 while ((read_bytes = fread(file_buf, 1, sizeof(file_buf), fp)) > 0) {
@@ -203,7 +236,7 @@ void *handle_connection(void *arg) {
                         sent += s;
                     }
                 }
-                fseek(fp, 0, SEEK_END);
+                fseek(fp, 0, SEEK_END);  // Sau khi đọc xong thì reposition lại cuối
                 pthread_mutex_unlock(&mutex_file);
                 break;
             }
